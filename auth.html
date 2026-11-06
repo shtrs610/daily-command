@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<title>Daily Command ログイン</title>
+</head>
+<body style="font-family:system-ui,sans-serif;padding:24px;line-height:1.7">
+<p id="m">ログインしています…</p>
+<script>
+(() => {
+  // 中継サーバーから戻ってきた結果を、開いているDaily Commandの画面に渡して、この窓を閉じる
+  const p = new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null, "", location.pathname); // 住所に残さない
+  const msg = { type: "dc-auth" };
+  ["n", "session", "access_token", "expires_in", "scope", "error"].forEach((k) => { if (p.get(k)) msg[k] = p.get(k); });
+  try { const bc = new BroadcastChannel("dc-auth"); bc.postMessage(msg); bc.close(); } catch {}
+  try { if (window.opener) window.opener.postMessage(msg, location.origin); } catch {}
+  document.getElementById("m").textContent = msg.error ? "ログインできませんでした。この窓を閉じて、もう一度押してください。" : "ログインできました。この窓は閉じてかまいません。";
+  setTimeout(() => window.close(), 600);
+})();
+</script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com/gsi/style; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src https://api.todoist.com https://www.googleapis.com https://accounts.google.com https://oauth2.googleapis.com; frame-src https://accounts.google.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com/gsi/style; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src https://api.todoist.com https://www.googleapis.com https://accounts.google.com https://oauth2.googleapis.com https://*.workers.dev; frame-src https://accounts.google.com; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#2c4f9e">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1194,6 +1194,9 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
   // （ここから下の「連携」ブロックだけが claude.ai 版と違います）
   // ===================================================================
   const GOOGLE_CLIENT_ID = "587610367313-256lim5f6poir1b78muc6202bn2tbd5m.apps.googleusercontent.com";
+  // 中継サーバー（Cloudflare Workers）。空なら従来どおり1時間ごとのログイン
+  const AUTH_URL = "https://dc-auth.shtrs610.workers.dev";
+  const b64rand = (n) => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(n)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/drive.appdata"];
   const TD_BASE = "https://api.todoist.com/api/v1/";
   const GCAL = "https://www.googleapis.com/calendar/v3";
@@ -1287,7 +1290,58 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
   // ---------- Google（ログイン：Google Identity Services のトークン方式） ----------
   const GAUTH = {
     token: null, exp: 0, client: null, wait: null,
-    ready() { return !!(window.google && google.accounts && google.accounts.oauth2); },
+    ready() { return !!AUTH_URL || !!(window.google && google.accounts && google.accounts.oauth2); },
+    // 中継サーバー方式：切れたら取り直す鍵（暗号化済み）を持っているか
+    sess() { const v = AUTH_URL && load("dc.gsess"); return typeof v === "string" && v ? v : ""; },
+    renewing: null,
+    // 新しい1時間の鍵を裏で取る（ポップアップなし。クリックの中でなくてよい）
+    renew() {
+      if (this.renewing) return this.renewing;
+      const ss = this.sess();
+      if (!ss) return Promise.reject(apiErr(this.seen() ? "gc_auth" : "gc_login"));
+      this.renewing = (async () => {
+        let r;
+        try { r = await fetch(AUTH_URL + "/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: ss }) }); }
+        catch (e) { throw apiErr("gc_net", String(e && e.message || e)); }
+        let b = {}; try { b = await r.json(); } catch {}
+        if (r.status === 401) { removeKey("dc.gsess"); this.expire(); throw apiErr("gc_auth", "expired"); }
+        if (!r.ok || !b.access_token) throw apiErr("gc_net", "token " + r.status);
+        this.setToken(b.access_token, b.expires_in, b.scope);
+      })().finally(() => { this.renewing = null; });
+      return this.renewing;
+    },
+    // 残り5分を切っていたら取り直す。gFetchの前・定期的に呼ぶ
+    async ensure() {
+      if (this.sess() && (!this.token || this.exp - Date.now() < 5 * 60000)) { try { await this.renew(); } catch (e) { if (!this.valid()) throw e; } }
+    },
+    setToken(token, expiresIn, scope) {
+      this.token = token; this.exp = Date.now() + (Number(expiresIn) || 3599) * 1000;
+      save("dc.gtoken", { token: this.token, exp: this.exp }); save("dc.gseen", 1);
+      if (scope && !GOOGLE_SCOPES.every((x) => String(scope).split(" ").includes(x))) toast("Googleの許可が一部たりません。「つなぎ直す」で、すべての項目にチェックを入れてください");
+      updateConnUI();
+    },
+    // 小窓で中継サーバーのログインを開く（必ずクリックの中で呼ぶ）
+    popup() {
+      return new Promise((resolve, reject) => {
+        const n = b64rand(24);
+        const w = window.open(AUTH_URL + "/login?n=" + n, "dcauth", "width=520,height=680");
+        if (!w) { reject(apiErr("gsi_popup_failed_to_open")); return; }
+        let bc = null, timer = 0, closedAt = 0;
+        const finish = (fn, v) => { try { bc && bc.close(); } catch {} window.removeEventListener("message", onMsg); clearInterval(timer); fn(v); };
+        const handle = (m) => {
+          if (!m || m.type !== "dc-auth" || m.n !== n) return;
+          if (m.error || !m.session || !m.access_token) { finish(reject, apiErr("gsi_denied", m.error || "")); return; }
+          save("dc.gsess", m.session);
+          this.setToken(m.access_token, m.expires_in, m.scope);
+          finish(resolve, m);
+        };
+        const onMsg = (ev) => { if (ev.origin === location.origin) handle(ev.data); };
+        window.addEventListener("message", onMsg);
+        try { bc = new BroadcastChannel("dc-auth"); bc.onmessage = (ev) => handle(ev.data); } catch {}
+        // 窓が閉じられたら（結果が届くのを少し待ってから）あきらめる
+        timer = setInterval(() => { let c = false; try { c = w.closed; } catch {} if (c) { if (!closedAt) closedAt = Date.now(); else if (Date.now() - closedAt > 2500) finish(reject, apiErr("gsi_popup_closed")); } }, 500);
+      });
+    },
     seen() { return !!load("dc.gseen"); },
     restore() { const v = load("dc.gtoken"); if (v && typeof v.token === "string" && v.exp > Date.now() + 60000) { this.token = v.token; this.exp = v.exp; } },
     valid() { return !!this.token && Date.now() < this.exp - 60000; },
@@ -1295,6 +1349,11 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
     expire() { this.token = null; this.exp = 0; removeKey("dc.gtoken"); updateConnUI(); },
     // 必ずボタンを押したとき（クリックの中）に呼ぶ。ポップアップが止められないように
     connect(prompt = "") {
+      if (AUTH_URL) {
+        // 鍵を持っていれば裏で取り直す。なければ（または同意し直すときは）小窓でログイン
+        if (this.sess() && prompt !== "consent") return this.renew();
+        return this.popup();
+      }
       return new Promise((resolve, reject) => {
         if (!this.ready()) { reject(apiErr("gsi_missing")); return; }
         if (!this.client) this.client = google.accounts.oauth2.initTokenClient({ client_id: GOOGLE_CLIENT_ID, scope: GOOGLE_SCOPES.join(" "),
@@ -1326,6 +1385,7 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
     return "Googleにつなげませんでした。もう一度押してください。";
   }
   async function gFetch(url, opt = {}) {
+    await GAUTH.ensure();
     if (!GAUTH.valid()) throw apiErr(GAUTH.seen() ? "gc_auth" : "gc_login");
     const headers = { Authorization: "Bearer " + GAUTH.token, ...(opt.headers || {}) };
     let body = opt.body;
@@ -1386,6 +1446,7 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
       return d;
     }
     async function syncNow() {
+      await GAUTH.ensure();
       if (!GAUTH.valid()) throw apiErr(GAUTH.seen() ? "gc_auth" : "gc_login");
       if (!fileId) fileId = await DRIVE.findId("settings.json");
       const remote = fileId ? await DRIVE.read(fileId) : null;
@@ -1578,9 +1639,12 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
     if (!S.calendars.length) {
       const r = await withRetry(() => call(GC, "list_calendars", {}));
       S.calendars = (r && r.calendars) || [];
-      const stored = load("board.cals");
-      S.selectedCals = Array.isArray(stored) ? stored.filter((id) => S.calendars.some((c) => c.id === id))
-        : S.calendars.filter((c, i) => i === 0 || /学校|書記|祝日/.test(c.summary || "")).map((c) => c.id);
+      // はじめは全部表示。自分で外したものだけ外したままにし、新しく増えたカレンダーは表示する
+      const stored = load("board.cals"), known = load("board.calsknown");
+      S.selectedCals = Array.isArray(stored) && Array.isArray(known)
+        ? S.calendars.filter((c) => stored.includes(c.id) || !known.includes(c.id)).map((c) => c.id)
+        : S.calendars.map((c) => c.id);
+      save("board.cals", S.selectedCals); save("board.calsknown", S.calendars.map((c) => c.id));
       fillCalSelect();
     }
     // 表示中の月と、今日から30日先（次の行事・祝日の判定用）をまとめて読む
@@ -2526,7 +2590,7 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
   $("calCancel").onclick = () => $("calDialog").close();
   $("calSave").onclick = async () => {
     S.selectedCals = [...$("calList").querySelectorAll('input[type="checkbox"]:checked')].map((x) => x.value);
-    save("board.cals", S.selectedCals);
+    save("board.cals", S.selectedCals); save("board.calsknown", S.calendars.map((c) => c.id));
     const colors = {};
     S.calendars.forEach((c, i) => { const v = pickedColor(i); if (v) colors[c.id] = v; });
     S.calColors = colors; save("board.calcolors", colors);
@@ -2599,7 +2663,8 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
     const g = $("gReconnect");
     if (g) { g.hidden = !S.mcp || GAUTH.valid(); g.textContent = GAUTH.seen() ? "Googleにつなぎ直す" : "Googleにログイン"; }
     if (!$("connDialog").open) return;
-    $("connGState").textContent = GAUTH.valid() ? `ログイン中です（あと${GAUTH.left()}分ほどで切れます。切れたら押すだけでつなぎ直せます）` : GAUTH.seen() ? "接続が切れています。" : "まだログインしていません。";
+    $("connGState").textContent = GAUTH.valid() && GAUTH.sess() ? "ログイン中です（自動で更新されます。7日ほどたつと、一度ログインし直しが必要です）"
+      : GAUTH.valid() ? `ログイン中です（あと${GAUTH.left()}分ほどで切れます。切れたら押すだけでつなぎ直せます）` : GAUTH.seen() ? "接続が切れています。" : "まだログインしていません。";
     $("connGoogle").textContent = GAUTH.valid() ? "Googleにつなぎ直す" : "Googleにログイン";
     const t = TDT.get();
     $("connTState").textContent = t ? `この端末に保存済みです（末尾 …${t.slice(-4)}）。` : "まだ入っていません。";
@@ -2608,6 +2673,9 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
     $("connModeSwitch").textContent = MODE === "local" ? "「この端末に残さない」に切りかえる" : "「この端末に保存する」に切りかえる";
   }
   setInterval(updateConnUI, 30000);
+  const autoRenew = () => { if (S.mcp && GAUTH.sess()) GAUTH.ensure().then(() => { if (S.errors && S.errors.gc && GAUTH.valid()) refresh(); }, () => updateConnUI()); };
+  setInterval(autoRenew, 60000);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") autoRenew(); });
   function connMsg(id, text, bad) { const el = $(id); el.textContent = text; el.classList.toggle("errtext", !!bad); }
 
   // Googleにログイン（またはつなぎ直し）。必ずボタンを押したときに呼ぶ
@@ -2727,7 +2795,8 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
   };
   async function logoutHere() {
     NO_SAVE = true;
-    const tok = GAUTH.token || (load("dc.gtoken") || {}).token;
+    const tok = GAUTH.token || (load("dc.gtoken") || {}).token, ss = GAUTH.sess();
+    if (ss) await Promise.race([fetch(AUTH_URL + "/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session: ss }) }).catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
     [localStorage, sessionStorage].forEach((st) => { try { appKeys(st).forEach((k) => st.removeItem(k)); } catch {} });
     PHOTOS.clear(); GAUTH.token = null;
     if (tok && GAUTH.ready()) await new Promise((res) => { const t = setTimeout(res, 3000); try { google.accounts.oauth2.revoke(tok, () => { clearTimeout(t); res(); }); } catch { clearTimeout(t); res(); } });
@@ -2792,6 +2861,7 @@ html body header .brand .mascot { width: 72px; height: auto; flex: none; align-s
     if (!MODE) await waitGate();
     S.mcp = ADAPTER;
     GAUTH.restore();
+    if (!GAUTH.valid() && GAUTH.sess()) { try { await GAUTH.renew(); } catch (e) { console.warn("renew", e); } }
     updateConnUI();
     if (GAUTH.valid()) await afterGoogle({ noRefresh: true });
     await refresh();

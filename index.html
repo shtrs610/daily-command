@@ -951,6 +951,10 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
 .mascot.fx-jump { animation: fx-jump .7s cubic-bezier(.3,1.4,.5,1); }
 .mascot { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) { .fx-land, .toast:not([hidden]), .mascot.fx-jump { animation: none !important; } }
+/* 入力欄：選んだ種類の項目だけ出す */
+html body .add [hidden] { display: none !important; }
+/* 月カレンダー：5件入る高さ（スマホは今まで通り3件） */
+@media (min-width: 601px) { html body .mc { min-height: 132px; } }
 </style>
 </head>
 <body>
@@ -1289,7 +1293,7 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
   // claude.ai 版（Todoist公式MCP）と同じ形に直す
   const mapTask = (t) => ({ id: String(t.id), content: t.content || "", description: t.description || "", dueDate: localDue(t.due),
     recurring: t.due && t.due.is_recurring && t.due.string ? t.due.string : false, priority: NUM_TO_PRI[t.priority] || "p4",
-    projectId: t.project_id == null ? "" : String(t.project_id), checked: !!t.checked });
+    projectId: t.project_id == null ? "" : String(t.project_id), checked: !!t.checked, addedAt: t.added_at || "" });
   // 日付だけを変えた due を作る。繰り返しタスクは string（例「毎週月曜」）と is_recurring を一緒に送り、繰り返しを消さない
   // （Todoist公式MCPの reschedule-tasks と同じ方法。date だけを送ると繰り返しが消えるため）
   function movedDue(due, date) {
@@ -1756,6 +1760,9 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
   const holidayOn = (d) => evOn(d).find((e) => isHolidayCal(e.cal));
   const sortEv = (a, b) => (a.allDay === b.allDay ? (a.startDT || "").localeCompare(b.startDT || "") : a.allDay ? -1 : 1);
   const priRank = (p) => ({ p1: 1, p2: 2, p3: 3 }[p] || 4);
+  // 今日このボードやTodoistで追加したタスク（新しいほど大きい数。古いものは0）
+  const freshAt = (t) => { if (/^tmp-/.test(t.id)) return 9e15; const a = t.addedAt ? new Date(t.addedAt).getTime() : 0; return a && ymd(new Date(a)) === today() ? a : 0; };
+  const taskOrder = (a, b) => (freshAt(b) - freshAt(a)) || (priRank(a.priority) - priRank(b.priority));
 
   function errBlock(key, server) {
     const e = S.errors[key];
@@ -1877,7 +1884,7 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
     $("todayLabel").textContent = `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日（${DOW[d.getDay()]}）${rokuyo(ymd(d)) ? " " + rokuyo(ymd(d)) : ""}`;
 
     const overdue = S.tasks.filter((t) => tDate(t) && tDate(t) < td).sort((a, b) => tDate(a).localeCompare(tDate(b)));
-    const todayTasks = S.tasks.filter((t) => tDate(t) === td).sort((a, b) => priRank(a.priority) - priRank(b.priority));
+    const todayTasks = S.tasks.filter((t) => tDate(t) === td).sort(taskOrder);
     const todayEv = evOn(td).filter((e) => !isHolidayCal(e.cal)).sort(sortEv);
     const gyoji = S.events.filter((e) => e.allDay && !isHolidayCal(e.cal) && e.start >= td)
       .sort((a, b) => a.start.localeCompare(b.start));
@@ -1896,9 +1903,9 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
     // 並び順は自分で決めた順を優先し、まだ並べていないものは後ろに続ける
     const ord = S.order && S.order.date === td ? S.order.ids : [];
     const items = [...todayEv.map((e) => ({ key: "e:" + e.id, ev: e, html: eventLi(e, td, { drag: true }) })),
-      ...todayTasks.map((t) => ({ key: "t:" + t.id, html: taskLi(t, { showDate: false, drag: true }) }))];
-    const pos = (k) => { const i = ord.indexOf(k); return i < 0 ? 1e6 : i; };
-    const sorted = items.map((x, i) => ({ ...x, i })).sort((a, b) => pos(a.key) - pos(b.key) || a.i - b.i);
+      ...todayTasks.map((t) => ({ key: "t:" + t.id, fresh: freshAt(t), html: taskLi(t, { showDate: false, drag: true }) }))];
+    const pos = (k, x) => { const i = ord.indexOf(k); return i >= 0 ? i : x && x.fresh ? -1 : 1e6; };
+    const sorted = items.map((x, i) => ({ ...x, i })).sort((a, b) => pos(a.key, a) - pos(b.key, b) || a.i - b.i);
     // 予定は1行のコンパクト表示。終わった予定と4件目以降はたたんでおき、タスクが下に押し出されないようにする
     const EV_LIMIT = 3, nowMs = Date.now();
     const evItems = sorted.filter((x) => x.key.startsWith("e:"));
@@ -1926,7 +1933,7 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
     // 明日：予定とタスクを、今日の下に小さめに出す
     const tm = addDays(td, 1), tmHol = holidayOn(tm);
     const tmEv = evOn(tm).filter((e) => !isHolidayCal(e.cal)).sort(sortEv);
-    const tmTasks = S.tasks.filter((t) => tDate(t) === tm).sort((a, b) => priRank(a.priority) - priRank(b.priority));
+    const tmTasks = S.tasks.filter((t) => tDate(t) === tm).sort(taskOrder);
     const tmEvH = tmEv.map((e) => eventLi(e, tm)), tmTkH = tmTasks.map((t) => taskLi(t, { showDate: false }));
     $("tmDate").textContent = `${md(tm)}(${dow(tm)})${tmHol ? " " + tmHol.title : ""}`;
     $("tmCount").textContent = `予定${tmEv.length}・タスク${tmTasks.length}`;
@@ -1953,9 +1960,10 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
       const dt = parseYmd(day), w = dt.getDay(), hol = holidayOn(day);
       const ev = evOn(day).filter((e) => !isHolidayCal(e.cal)).sort(sortEv);
       const cls = ["mc", dt.getMonth() !== S.month.m ? "out" : "", w === 6 ? "sat" : "", w === 0 ? "sun" : "", hol ? "hol" : "", day === td ? "today" : "", day === S.selDay ? "sel" : ""].join(" ");
-      const shown = ev.slice(0, 3).map((e) => `<span class="me" style="--c:${calColor(e.cal)}" data-eid="${esc(e.id)}" data-cal="${esc(e.cal)}" data-day="${day}" title="${canEditEv(e) ? "ドラッグで別の日へ移動" : "ほかの人の予定（移動できません）"}">${!e.allDay && e.start === day ? `<span class="num">${hm(e.startDT)}</span> ` : ""}${esc(e.title)}</span>`).join("");
+      const MAXE = matchMedia("(max-width: 600px)").matches ? 3 : 5;
+      const shown = ev.slice(0, MAXE).map((e) => `<span class="me" style="--c:${calColor(e.cal)}" data-eid="${esc(e.id)}" data-cal="${esc(e.cal)}" data-day="${day}" title="${canEditEv(e) ? "ドラッグで別の日へ移動" : "ほかの人の予定（移動できません）"}">${!e.allDay && e.start === day ? `<span class="num">${hm(e.startDT)}</span> ` : ""}${esc(e.title)}</span>`).join("");
       cells.push(`<button class="${cls}" type="button" data-day="${day}" aria-pressed="${day === S.selDay}" aria-label="${day === td ? "今日 " : ""}${dt.getMonth() + 1}月${dt.getDate()}日 ${DOW[w]}曜日 予定${ev.length}件">
-        <span class="mtop"><span class="mn num">${dt.getDate()}</span>${day === td ? `<span class="todaytag">今日</span>` : ""}${rokuyo(day) ? `<span class="rk">${rokuyo(day)}</span>` : ""}</span>${hol ? `<span class="mh">${esc(hol.title)}</span>` : ""}${shown}${ev.length > 3 ? `<span class="more">他${ev.length - 3}件</span>` : ""}</button>`);
+        <span class="mtop"><span class="mn num">${dt.getDate()}</span>${day === td ? `<span class="todaytag">今日</span>` : ""}${rokuyo(day) ? `<span class="rk">${rokuyo(day)}</span>` : ""}</span>${hol ? `<span class="mh">${esc(hol.title)}</span>` : ""}${shown}${ev.length > MAXE ? `<span class="more">他${ev.length - MAXE}件</span>` : ""}</button>`);
     }
     const thisMonth = parseYmd(td).getMonth() === S.month.m && parseYmd(td).getFullYear() === S.month.y, tdw = parseYmd(td).getDay();
     const head = DOW.map((x, i) => `<div class="mdow ${i === 0 ? "sun" : i === 6 ? "sat" : ""} ${thisMonth && i === tdw ? "today" : ""}">${x}</div>`).join("");
@@ -1985,7 +1993,7 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
     try {
       const r = await withRetry(() => call(TD, "find-tasks-by-date", { startDate: day, daysCount: 1, limit: 100, overdueOption: "exclude-overdue" }));
       if (S.selDay !== day) return;
-      S.dayTasks = { date: day, tasks: ((r && r.tasks) || []).filter((t) => !t.checked).sort((a, b) => priRank(a.priority) - priRank(b.priority)), loading: false, err: null };
+      S.dayTasks = { date: day, tasks: ((r && r.tasks) || []).filter((t) => !t.checked).sort(taskOrder), loading: false, err: null };
     } catch (e) {
       if (S.selDay !== day) return;
       if (!quiet) S.dayTasks = { date: day, tasks: [], loading: false, err: e };
@@ -2309,9 +2317,9 @@ html body .mc.out .mn, html body .mc.out .me, html body .mc.out .mh, html body .
       save("board.proj", project);
       const task = { content: title, dueString: date, priority };
       if (project) task.projectId = project;
-      const tmp = { id: "tmp-" + Date.now(), content: title, dueDate: date, priority, projectId: project, description: "", checked: false };
+      const tmp = { id: "tmp-" + Date.now(), content: title, dueDate: date, priority, projectId: project, description: "", checked: false, addedAt: new Date().toISOString() };
       $("addTitle").value = "";
-      quick(() => { S.tasks.push(tmp); return () => { const i = S.tasks.indexOf(tmp); if (i >= 0) S.tasks.splice(i, 1); }; },
+      quick(() => { S.tasks.unshift(tmp); return () => { const i = S.tasks.indexOf(tmp); if (i >= 0) S.tasks.splice(i, 1); }; },
         () => call(TD, "add-tasks", { tasks: [task] }), `タスク「${title}」を${md(date)}に追加しました`, TD, refreshTasks);
     } else {
       const cal = $("addCal").value; save("board.addcal", cal);
